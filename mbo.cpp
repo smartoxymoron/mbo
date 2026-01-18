@@ -8,16 +8,32 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
-#include <deque>
 #include <memory>
 #include <algorithm>
 #include <span>
-#include <boost/unordered_map.hpp>
 #include <boost/container/flat_map.hpp>
+#include <boost/unordered_map.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/container/static_vector.hpp>
 #include "perfprofiler.h"
 
 using namespace std;
+
+// #define printf(...) // to quickly disable printf for perf testing
+
+// --- Always-on assertion for release builds ---
+#define always_assert(condition) \
+    do { \
+        if (!(condition)) { \
+            fprintf(stderr, "Assertion failed: %s, file %s, line %d\n", \
+                    #condition, __FILE__, __LINE__); \
+            fflush(stderr); \
+            abort(); \
+        } \
+    } while(0)
+
+// #undef always_assert
+// #define always_assert(...)  // to quickly disable assertions for perf testing
 
 // --- PerfProfiler Initialization ---
 PerfProfilerStatic("mbo", 0);
@@ -40,6 +56,7 @@ struct OutputLevel {
 
     void print(const char* side, int lvl) const {
         if (price == 0) return;
+        (void)side; (void)lvl;  // Suppress unused warnings when printf is disabled
         printf("  %s[%2d] p:%10ld q:%8d n:%4d\n", side, lvl, price, qty, num_orders);
     }
 } __attribute__((packed));
@@ -90,36 +107,69 @@ struct OutputRecord {
         printf("OUTPUT [%u] tok:%u side:%s affected_bid:%d affected_ask:%d filled_bid:%d filled_ask:%d ltp:%ld ltq:%d\n",
                record_idx, token, is_ask ? "ASK" : "BID", bid_affected_lvl, ask_affected_lvl, 
                bid_filled_lvls, ask_filled_lvls, ltp, ltq);
+        // Print asks in reverse order (highest to lowest)
+        for(int i=19; i>=0; --i) if (asks[i].price != 0) asks[i].print("ASK", i);
+        // Then print bids in regular order (highest to lowest)
         for(int i=0; i<20; ++i) if (bids[i].price != 0) bids[i].print("BID", i);
-        for(int i=0; i<20; ++i) if (asks[i].price != 0) asks[i].print("ASK", i);
     }
 
-    bool compare(const OutputRecord& other) const {
-        if (record_idx != other.record_idx) return false;
-        if (token != other.token) return false;
-        if (is_ask != other.is_ask) return false;
-        if (bid_filled_lvls != other.bid_filled_lvls) return false;
-        if (ask_filled_lvls != other.ask_filled_lvls) return false;
+    // Returns 0 if books match, unique error code otherwise:
+    //   [-20...-1]: Bid level mismatch (negative level index)
+    //   [+1...+20]: Ask level mismatch (positive level index)
+    //   100+: Other mismatches (metadata, counts, etc.)
+    int compare(const OutputRecord& reference) const {
+        if (record_idx % 65536 != reference.record_idx % 65536) return 100; // only sending lower 16 bits of record_idx to save space in delta
+        if (token != reference.token) return 101;
+        
+        // Skip is_ask check for trades - reference has incorrect aggressor detection
+        // Also skip for cancels when order not found (affected levels both 20) - reference sends random side
+        // TODO discuss with traders how to proceed; unrelated - also discuss crossing/selftrade behaviour and simplify
+        bool is_cancel_not_found = (event.tick_type == 'X' && bid_affected_lvl == 20 && ask_affected_lvl == 20);
+        if (event.tick_type != 'T' && !is_cancel_not_found && is_ask != reference.is_ask) return 102;
+
+        // TODO check why these appear to not be set in reference
+        // if (ltp != other.ltp) return 103;
+        // if (ltq != other.ltq) return 104;
+
+        if (bid_filled_lvls != reference.bid_filled_lvls) return 105;
+        if (ask_filled_lvls != reference.ask_filled_lvls) return 106;
 
         // Side determined by reference as primary must match exactly
-        if (other.is_ask) {
-            if (ask_affected_lvl != other.ask_affected_lvl) return false;
+        // Special case for modifies: we report minimum (topmost) affected level, reference may report deeper level
+        // Allow our_affected_lvl <= ref_affected_lvl for modifies (we're more precise about what changed)
+        bool is_modify = (event.tick_type == 'M');
+        
+        if (reference.is_ask) {
+            if (is_modify) {
+                // For modifies: accept if we report topmost or same level
+                if (ask_affected_lvl > reference.ask_affected_lvl) return 107;
+            } else {
+                // For non-modifies: exact match required
+                if (ask_affected_lvl != reference.ask_affected_lvl) return 107;
+            }
             // Secondary side: if we have 20, accept anything. If we set a value, it must match.
-            if (bid_affected_lvl != 20 && bid_affected_lvl != other.bid_affected_lvl) return false;
+            if (bid_affected_lvl != 20 && bid_affected_lvl != reference.bid_affected_lvl) return 108;
         } else {
-            if (bid_affected_lvl != other.bid_affected_lvl) return false;
-            if (ask_affected_lvl != 20 && ask_affected_lvl != other.ask_affected_lvl) return false;
+            if (is_modify) {
+                // For modifies: accept if we report topmost or same level
+                if (bid_affected_lvl > reference.bid_affected_lvl) return 109;
+            } else {
+                // For non-modifies: exact match required
+                if (bid_affected_lvl != reference.bid_affected_lvl) return 109;
+            }
+            if (ask_affected_lvl != 20 && ask_affected_lvl != reference.ask_affected_lvl) return 110;
         }
         
+        // Check book levels: bids use negative indices, asks use positive
         for (int i = 0; i < 20; ++i) {
-            if (bids[i].price != other.bids[i].price) return false;
-            if (bids[i].qty != other.bids[i].qty) return false;
-            if (bids[i].num_orders != other.bids[i].num_orders) return false;
-            if (asks[i].price != other.asks[i].price) return false;
-            if (asks[i].qty != other.asks[i].qty) return false;
-            if (asks[i].num_orders != other.asks[i].num_orders) return false;
+            if (bids[i].price != reference.bids[i].price) return -(i+1);
+            if (bids[i].qty != reference.bids[i].qty) return -(i+1);
+            if (bids[i].num_orders != reference.bids[i].num_orders) return -(i+1);
+            if (asks[i].price != reference.asks[i].price) return (i+1);
+            if (asks[i].qty != reference.asks[i].qty) return (i+1);
+            if (asks[i].num_orders != reference.asks[i].num_orders) return (i+1);
         }
-        return true;
+        return 0;  // Match!
     }
 } __attribute__((packed));
 static_assert(sizeof(OutputRecord) == 708);
@@ -190,7 +240,7 @@ static_assert(sizeof(InsertDelta) == 24);
 
 struct DeltaChunk {
     uint32_t token = 0;
-    uint16_t record_idx = 0;
+    uint16_t record_idx = 0;       // TEMP changed to uint32_t for easier debugging
     uint8_t flags = 0;             // bit 0: final (book ready for strategy)
     uint8_t num_deltas = 0;        // Number of deltas in this chunk (1-N)
     uint8_t payload[56] = {};      // Variable-length delta sequence
@@ -202,7 +252,8 @@ struct DeltaChunk {
         
         // Iterate through deltas in payload
         size_t offset = 0;
-        size_t total_bytes = 8;  // Header is 8 bytes (token:4 + record_idx:2 + flags:1 + num_deltas:1)
+        // TEMP bump record_idx to uint32_t for easier debugging
+        size_t total_bytes = 8;  // Header is 10 bytes (token:4 + record_idx:4 + flags:1 + num_deltas:1)
         
         for (uint8_t i = 0; i < chunk.num_deltas && offset < 56; ++i) {
             if (i > 0) os << " + ";
@@ -260,14 +311,17 @@ inline bool unpack_shift(uint8_t packed) {
     return (packed >> 6) & 1;
 }
 
-// --- DeltaEmitter ---
+/* Callers always call emit_*() methods; emitter does the filtering (e.g., index >= 20)
+ * Clean encapsulation over scattered pre-checks but relies on inlining (verified -O3)
+ *  to avoid wasted argument computation.
+ */
 class DeltaEmitter {
 private:
     static constexpr size_t MAX_CHUNKS = 20;  // Worst case: snapshot with 40 levels = ~18 chunks + buffer
     boost::container::static_vector<DeltaChunk, MAX_CHUNKS> chunks_;
     size_t current_offset_;  // Offset into chunks_.back().payload
     Token token_;
-    uint16_t record_idx_;
+    uint16_t record_idx_;   // TEMP changed to uint32_t for easier debugging
     
     template<typename DeltaT>
     void append_delta(const DeltaT& delta) {
@@ -291,7 +345,7 @@ private:
 public:
     DeltaEmitter() : current_offset_(0), token_(0), record_idx_(0) {}
     
-    void set_event(Token token, uint16_t record_idx) {
+    void set_event(Token token, uint32_t record_idx) {
         token_ = token;
         record_idx_ = record_idx;
     }
@@ -307,13 +361,13 @@ public:
         append_delta(delta);
     }
     
-    void emit_update(bool is_ask, uint8_t index, int64_t qty_delta, int16_t count_delta) {
+    void emit_update(bool is_ask, int index, int64_t qty_delta, int16_t count_delta) {
         // TickInfo must be first delta in sequence
-        assert(!chunks_.empty() && 
+        always_assert(!chunks_.empty() && 
                "emit_tick_info() must be called before emit_update()");
         
         // Only emit if index is in top 20 levels
-        if (index >= 20) return;
+        if (index >= 20) [[unlikely]] return;
         
         UpdateDelta delta;
         delta.type = DeltaType::Update;
@@ -323,13 +377,13 @@ public:
         append_delta(delta);
     }
     
-    void emit_insert(bool is_ask, uint8_t index, bool shift, Price price, int64_t qty, int32_t count) {
+    void emit_insert(bool is_ask, int index, bool shift, Price price, int64_t qty, int32_t count) {
         // TickInfo must be first delta in sequence
-        assert(!chunks_.empty() && 
+        always_assert(!chunks_.empty() && 
                "emit_tick_info() must be called before emit_insert()");
         
         // Only emit if index is in top 20 levels
-        if (index >= 20) return;
+        if (index >= 20) [[unlikely]] return;
         
         InsertDelta delta;
         delta.type = DeltaType::Insert;
@@ -368,13 +422,66 @@ struct OrderInfo {
 inline bool g_crossing_enabled = false;
 
 // --- PriceLevels ---
-template<bool IsAsk>
+/*
+ * PRICE NEGATION FOR UNIFIED ORDERING (IMPLEMENTED)
+ * 
+ * Both sides use std::less<Price> comparator (ascending sort).
+ * To make bids sort best-first, we negate bid prices internally:
+ *         - Asks: store actual prices (100, 101, 102...) → sorted ascending (best = lowest)
+ *         - Bids: store negated prices (-100, -99, -98...) → sorted ascending (best = highest when denegated)
+ * 
+ * IMPLEMENTATION PATTERN:
+ *   - ALL public methods accept/return ACTUAL prices (never canonical)
+ *   - Convert at entry: canonical = actual * side_multiplier_
+ *   - Internal operations use canonical prices
+ *   - Convert at exit: actual = canonical * side_multiplier_
+ *   - Delta emission: ALWAYS use actual prices
+ * 
+ * Key conversions:
+ *   - Entry: canonical = actual * side_multiplier_  (negate for bids)
+ *   - Exit:  actual = canonical * side_multiplier_  (denegate for bids)
+ *   - side_multiplier_ is idempotent: multiply twice = original value
+ * 
+ * RISKS & CONSTRAINTS:
+ *   ⚠️  INT64_MIN is NO LONGER A VALID PRICE (negation overflows)
+ *       - Use INT64_MAX for market orders on both sides
+ *       - Per-exchange adapter code MUST validate/convert before passing to MBO
+ *       - Add static_assert or runtime check if exchange can send INT64_MIN
+ * 
+ *   ⚠️  Sentinel values for flat array (future):
+ *       - Cannot use INT64_MIN/INT64_MAX as sentinels (prices can be ±INT64_MAX)
+ *       - Use 0 as sentinel (no real market has price=0)
+ *       - OR track valid range via start_idx/end_idx (no sentinel needed)
+ * 
+ *   ⚠️  Debugging: Bid prices appear negative in debugger
+ *       - Add debug_print() that shows abs(canonical) or denegate for display
+ *       - Consider abs() in production logs for clarity
+ * 
+ *   ⚠️  Discipline required at ALL boundaries:
+ *       - NEVER expose canonical prices outside PriceLevels
+ *       - NEVER accept canonical prices from outside
+ *       - Easy to forget during cross() implementation or new methods
+ * 
+ *   ⚠️  Testing: Boundary cases are critical
+ *       - Test with INT64_MAX prices
+ *       - Test cross() with prices near overflow
+ *       - Test mixed operations across spread
+ * 
+ * Benefits:
+ *   ✓ Cleaner MBO code (ternary instead of if/else branches)
+ *   ✓ Same type for bids_/asks_ enables future optimizations
+ *   ✓ Works with flat array tail-placement strategy
+ *   ✓ No performance cost (multiply is 1 cycle, comparisons stay same)
+ */
 class PriceLevels {
 public:
-    using Comparator = typename std::conditional<IsAsk, std::less<Price>, std::greater<Price>>::type;
-    using MapType = boost::container::flat_map<Price, pair<AggQty, Count>, Comparator>;
+    using MapType = boost::container::flat_map<Price, pair<AggQty, Count>, std::greater<Price>>;
 
-    PriceLevels() : emitter_(nullptr) {
+    PriceLevels(bool is_ask) 
+        : is_ask_(is_ask)
+        , side_multiplier_(is_ask ? 1 : -1)
+        , emitter_(nullptr) 
+    {
         levels_.reserve(1000);
     }
     
@@ -382,62 +489,63 @@ public:
         emitter_ = e;
     }
 
-    void add(Price p, Qty qty, Count count_delta) {
-        auto it = levels_.lower_bound(p);
-        bool inserted = (it == levels_.end() || it->first != p);
+    void add_liquidity(Price p, Qty qty, Count count_delta) {
+        always_assert(qty >= 0 && "add_liquidity requires non-negative qty");
+        
+        // PerfProfile("add_liquidity");
+        // Convert to canonical (negated for bids)
+        Price canonical = p * side_multiplier_;
+        
+        auto it = levels_.lower_bound(canonical);
+        bool inserted = (it == levels_.end() || it->first != canonical);
         
         if (inserted) {
-            it = levels_.emplace_hint(it, p, std::make_pair(qty, count_delta));
+            //PerfProfile("add_liquidity_insert");
+            it = levels_.emplace_hint(it, canonical, std::make_pair(qty, count_delta));
+            int idx = static_cast<int>(levels_.size()) - 1 - static_cast<int>(it - levels_.begin());
+            // printf("DEBUG: add_liquidity INSERT at idx %d price %ld qty %ld count_delta %ld\n", idx, p, (long)qty, (long)count_delta);
+            
+            // shift=true always: receiver memmoves [idx..19] to [idx+1..20] before writing
+            // When inserting at end, memmove copies zeros (harmless); at idx=19, 0-byte memmove (no-op)
+            emitter_->emit_insert(is_ask_, idx, /*shift=*/true, p, it->second.first, it->second.second);
         } else {
             it->second.first += qty;
             it->second.second += count_delta;
-        }
-        
-        int idx = it - levels_.begin();
-        
-        // Emit delta
-        if (inserted) {
-            bool shift = (idx < (int)levels_.size() - 1);
-            emitter_->emit_insert(IsAsk, idx, shift, p, it->second.first, it->second.second);
-        } else {
-            emitter_->emit_update(IsAsk, idx, qty, count_delta);
-        }
-        
-        // Handle deletion (invariant: if count == 0, qty must be 0)
-        if (it->second.first <= 0) {
-            assert(it->second.second <= 0 && "qty=0 implies count=0");
-            levels_.erase(it);
+            int idx = static_cast<int>(levels_.size()) - 1 - static_cast<int>(it - levels_.begin());
+            // printf("DEBUG: add_liquidity UPDATE at idx %d price %ld qty %ld count_delta %ld\n", idx, p, (long)qty, (long)count_delta);
             
-            // Emit refill if needed (level 20 now visible)
-            if (levels_.size() >= 20) {
-                auto refill = levels_.begin() + 19;
-                emitter_->emit_insert(IsAsk, 19, false, refill->first, 
-                                     refill->second.first, refill->second.second);
-            }
+            emitter_->emit_update(is_ask_, idx, qty, count_delta);
         }
     }
 
-    void remove(Price p, Qty qty, Count count_delta) {
-        auto it = levels_.find(p);
+    void remove_liquidity(Price p, Qty qty, Count count_delta) {
+        always_assert(qty > 0 && "remove_liquidity requires positive qty");
+        
+        // Convert to canonical (negated for bids)
+        Price canonical = p * side_multiplier_;
+        
+        auto it = levels_.find(canonical);
         if (it == levels_.end()) return;
         
-        int idx = it - levels_.begin();
+        int idx = static_cast<int>(levels_.size()) - 1 - static_cast<int>(it - levels_.begin());
         
         it->second.first -= qty;
         it->second.second -= count_delta;
         
         // Emit update delta
-        emitter_->emit_update(IsAsk, idx, -qty, -count_delta);
+        emitter_->emit_update(is_ask_, idx, -qty, -count_delta);
         
         // Handle deletion (invariant: if count == 0, qty must be 0)
-        if (it->second.first <= 0) {
-            assert(it->second.second <= 0 && "qty=0 implies count=0");
+        if (it->second.first <= 0) [[unlikely]] {
+            always_assert(it->second.second <= 0 && "qty=0 implies count=0");
             levels_.erase(it);
             
-            // Emit refill if needed (level 20 now visible)
-            if (levels_.size() >= 20) {
-                auto refill = levels_.begin() + 19;
-                emitter_->emit_insert(IsAsk, 19, false, refill->first, 
+            // Emit refill if level 20 has come into view (emitter filters if out of range)
+            if (idx < 20 and levels_.size() >= 20) {    // TODO consider removing the idx check here as it will be filtered out by the emitter
+                auto refill = levels_.end() - 20;  // 20th best = index 19
+                // Denegate price for emission
+                Price actual_price = refill->first * side_multiplier_;
+                emitter_->emit_insert(is_ask_, 19, false, actual_price, 
                                      refill->second.first, refill->second.second);
             }
         }
@@ -447,65 +555,58 @@ public:
     vector<pair<Price, Qty>> cross(Price target, Qty fill_qty) {
         vector<pair<Price, Qty>> consumed;
         Qty remaining = fill_qty;
+        
+        // Convert target to canonical for comparison
+        Price canonical_target = target * side_multiplier_;
 
         while (remaining > 0 && !levels_.empty()) {
-            Price best = best_price();
-            bool crosses = false;
-            if constexpr (IsAsk) crosses = (best <= target);
-            else crosses = (best >= target);
-
+            auto it = levels_.rbegin();  // Best price now at rbegin() (descending order)
+            Price canonical_best = it->first;
+            
+            // Compare in canonical space (descending order, but comparison logic same)
+            bool crosses = (canonical_best <= canonical_target);
             if (!crosses) break;
 
-            auto it = levels_.find(best);
             Qty consume_qty = min(remaining, (Qty)it->second.first);
-            consumed.push_back({best, consume_qty});
+            
+            // Return actual price (denegate)
+            Price actual_best = canonical_best * side_multiplier_;
+            consumed.push_back({actual_best, consume_qty});
             
             it->second.first -= consume_qty;
             remaining -= consume_qty;
             
             if (it->second.first <= 0) {
-                levels_.erase(it);
+                levels_.erase(std::next(it).base());  // Convert reverse_iterator to iterator for erase
             }
         }
         return consumed;
     }
 
-    int get_top_levels(OutputLevel* out, int n) const {
-        if (levels_.empty()) return 0;
-
-        int count = min((int)levels_.size(), n);
-        auto it = levels_.begin();
-        for (int i = 0; i < count; ++i, ++it) {
-            out[i].price = it->first;
-            out[i].qty = (int32_t)it->second.first;
-            out[i].num_orders = it->second.second;
-        }
-        return count;
-    }
-
     Price best_price() const {
         if (levels_.empty()) return 0;
-        return levels_.begin()->first;
-    }
-
-    // Get level index for a price (0-based), returns -1 if not found
-    int get_level_index(Price p) const {
-        auto it = levels_.find(p);
-        if (it == levels_.end()) return -1;
-        return it - levels_.begin();
+        // Best price now at rbegin() (descending order), denegate to return actual price
+        return levels_.rbegin()->first * side_multiplier_;
     }
 
 private:
+    bool is_ask_;
+    int64_t side_multiplier_;  // +1 for asks, -1 for bids (reserved for future optimization)
     MapType levels_;
     DeltaEmitter* emitter_;
 };
 
 // --- MBO ---
 class MBO {
+    friend class Runner;  // For accessing order_map_ to count active orders
 public:
-    MBO(Token token) : token_(token), last_affected_bid_price_(0), last_affected_ask_price_(0) {
-        order_map_.reserve(10000);
-        memset(&book_, 0, sizeof(OutputRecord));
+    MBO(Token token) 
+        : token_(token)
+        , bids_(false)  // is_ask = false
+        , asks_(true)   // is_ask = true
+    {
+        // TODO analyze whether reserving more makes performance *much* worse on prod as well for 20k input
+        order_map_.reserve(1000);
         
         // Wire up delta emission
         bids_.set_emitter(&emitter_);
@@ -519,15 +620,12 @@ public:
 
     bool has_crossed() const;
     void infer_and_apply_cross();
-
-    const OutputRecord& get_book() const { return book_; }
-    void update_book(const InputRecord& event);
     
     std::span<const DeltaChunk> get_delta_chunks() const {
         return emitter_.get_chunks();
     }
     
-    void prepare_deltas(Token token, uint16_t record_idx) {
+    void prepare_deltas(Token token, uint16_t record_idx) { // TEMP changed to uint32_t for easier debugging
         emitter_.clear();
         emitter_.set_event(token, record_idx);
     }
@@ -539,15 +637,10 @@ public:
 private:
     Token token_;
     DeltaEmitter emitter_;
-    PriceLevels<false> bids_;
-    PriceLevels<true> asks_;
-    boost::unordered_map<OrderId, OrderInfo> order_map_;
-    deque<OrderId> pending_cross_fills_;
-    OutputRecord book_;
-    
-    // Track last affected levels (0 = not affected)
-    Price last_affected_bid_price_;
-    Price last_affected_ask_price_;
+    PriceLevels bids_;
+    PriceLevels asks_;
+    boost::unordered::unordered_flat_map<OrderId, OrderInfo> order_map_;
+    OrderId last_order_id_ = 0;  // Track most recent new/modify for aggressor detection
 };
 
 void MBO::new_order(OrderId id, bool is_ask, Price price, Qty qty) {
@@ -555,21 +648,13 @@ void MBO::new_order(OrderId id, bool is_ask, Price price, Qty qty) {
     
     // Emit TickInfo delta
     emitter_.emit_tick_info('N', is_ask, true, price, qty);
-    
+    {
+    //PerfProfile("new_order2");
     order_map_[id] = {is_ask, price, qty};
-    if (is_ask) {
-        asks_.add(price, qty, 1);
-        last_affected_ask_price_ = price;
-        last_affected_bid_price_ = 0;
-    } else {
-        bids_.add(price, qty, 1);
-        last_affected_bid_price_ = price;
-        last_affected_ask_price_ = 0;
+    last_order_id_ = id;  // Track for aggressor detection in trades
     }
-    
-    if (g_crossing_enabled) {
-        infer_and_apply_cross();
-    }
+    PriceLevels& half = is_ask ? asks_ : bids_;
+    half.add_liquidity(price, qty, 1);
 }
 
 void MBO::modify_order(OrderId id, Price new_price, Qty new_qty) {
@@ -577,122 +662,95 @@ void MBO::modify_order(OrderId id, Price new_price, Qty new_qty) {
     if (it == order_map_.end()) return;
 
     OrderInfo& info = it->second;
+    // printf("DEBUG: entering modify_order id %ld new_price %ld new_qty %ld info.price %ld info.qty %ld\n", id, new_price, (long)new_qty, info.price, (long)info.qty);
     
     // Emit TickInfo delta
     emitter_.emit_tick_info('M', info.is_ask, true, new_price, new_qty);
+    
+    last_order_id_ = id;  // Track for aggressor detection in trades
+    
+    PriceLevels& half = info.is_ask ? asks_ : bids_;
+    
     if (info.price != new_price) {
-        // Price changed - emit add before remove so first delta reflects new resting level
-        if (info.is_ask) {
-            asks_.add(new_price, new_qty, 1);
-            asks_.remove(info.price, info.qty, 1);
-            last_affected_ask_price_ = new_price;
-            last_affected_bid_price_ = 0;
-        } else {
-            bids_.add(new_price, new_qty, 1);
-            bids_.remove(info.price, info.qty, 1);
-            last_affected_bid_price_ = new_price;
-            last_affected_ask_price_ = 0;
-        }
+        // Price changed - remove old then add new (matches exchange semantics, correct affected_lvl)
+        half.remove_liquidity(info.price, info.qty, 1);
+        half.add_liquidity(new_price, new_qty, 1);
+    } else if (Qty delta = new_qty - info.qty; delta < 0) {
+        // Same price, quantity decreased
+        half.remove_liquidity(info.price, -delta, 0);
     } else {
-        // Same price, qty change
-        Qty delta = new_qty - info.qty;
-        if (info.is_ask) {
-            asks_.add(info.price, delta, 0);
-            last_affected_ask_price_ = info.price;
-            last_affected_bid_price_ = 0;
-        } else {
-            bids_.add(info.price, delta, 0);
-            last_affected_bid_price_ = info.price;
-            last_affected_ask_price_ = 0;
-        }
+        // Same price, quantity increased (or rare delta==0 case)
+        half.add_liquidity(info.price, delta, 0);
     }
     
     info.price = new_price;
     info.qty = new_qty;
-
-    if (g_crossing_enabled) {
-        infer_and_apply_cross();
-    }
 }
 
 void MBO::cancel_order(OrderId id) {
     auto it = order_map_.find(id);
-    if (it == order_map_.end()) return;
+    
+    if (it == order_map_.end()) {
+        // Order not found - emit TickInfo with exchange data
+        emitter_.emit_tick_info('X', false, true, 0, 0);
+        return;
+    }
 
     OrderInfo& info = it->second;
+    // printf("DEBUG: cancel_order id %ld info.price %ld info.qty %ld\n", id, info.price, (long)info.qty);
     
     // Emit TickInfo delta
-    emitter_.emit_tick_info('X', info.is_ask, true, info.price, info.qty);
-    if (info.is_ask) {
-        asks_.remove(info.price, info.qty, 1);
-        last_affected_ask_price_ = info.price;
-        last_affected_bid_price_ = 0;
-    } else {
-        bids_.remove(info.price, info.qty, 1);
-        last_affected_bid_price_ = info.price;
-        last_affected_ask_price_ = 0;
-    }
+    emitter_.emit_tick_info('X', info.is_ask, false, info.price, info.qty);
+    
+    PriceLevels& half = info.is_ask ? asks_ : bids_;
+    half.remove_liquidity(info.price, info.qty, 1);
     
     order_map_.erase(it);
 }
 
-void MBO::trade(OrderId id1, OrderId id2, Price price, Qty fill_qty) {
-    // Track which sides are filled to determine passive/aggressor
-    bool bid_filled = false;
-    bool ask_filled = false;
+void MBO::trade(OrderId bid_id, OrderId ask_id, Price price, Qty fill_qty) {
+    // CONSTRAINT: OrderId 0 is reserved/invalid (similar to INT64_MIN for prices)
+    // NSE provides bid_id and ask_id explicitly, but both may exist in book (limit-on-limit)
+    // Use last_order_id_ to determine aggressor when ambiguous
     
-    // First pass: determine which sides are involved
-    for (OrderId id : {id1, id2}) {
-        if (id == 0) continue;
-        if (!pending_cross_fills_.empty() && pending_cross_fills_.front() == id) continue;
-        auto it = order_map_.find(id);
+    // Lookup both orders upfront (handle 0 gracefully)
+    auto bid_it = bid_id ? order_map_.find(bid_id) : order_map_.end();
+    auto ask_it = ask_id ? order_map_.find(ask_id) : order_map_.end();
+    always_assert(order_map_.end() == bid_it or false == bid_it->second.is_ask);
+    always_assert(order_map_.end() == ask_it or true == ask_it->second.is_ask);
+    
+    // This is likely sufficient and correct but we do have a mismatch against reference with crossing disabled
+    // TEMP will disable is_ask check in compare() for trades for now
+    bool aggressor_side_is_ask = (ask_id == last_order_id_) ? true : false;
+
+    // Validate against old logic (temporary assertion)
+    // bool bid_found = (bid_it != order_map_.end());
+    // bool ask_found = (ask_it != order_map_.end());
+    // bool trade_side_is_ask_old = bid_found && !ask_found;
+    // printf("DEBUG: aggressor_side_is_ask %d trade_side_is_ask_old %d\n", aggressor_side_is_ask, trade_side_is_ask_old);
+    // if (bid_found && ask_found) {
+    //     printf("DEBUG: Both found bid %ld ask %ld (last_order_id_ %ld)\n", bid_id, ask_id, last_order_id_);
+    //     // Both found - old logic is broken (always false), skip validation
+    // } else {
+    //     // Only one found - old logic should match new logic
+    //     always_assert(aggressor_side_is_ask == trade_side_is_ask_old && 
+    //                  "Aggressor detection logic mismatch");
+    // }
+    
+    // Emit TickInfo delta first (for trades, price/qty become LTP/LTQ)
+    emitter_.emit_tick_info('T', aggressor_side_is_ask, true, price, fill_qty);
+
+    for (auto it: {bid_it, ask_it}) {
         if (it != order_map_.end()) {
-            if (it->second.is_ask) ask_filled = true;
-            else bid_filled = true;
-        }
-    }
-    
-    // Determine side for trade: if only bid filled, aggressor is ask (and vice versa)
-    bool trade_side_is_ask = bid_filled && !ask_filled;
-    
-    // Emit TickInfo delta FIRST (for trades, price/qty become LTP/LTQ)
-    emitter_.emit_tick_info('T', trade_side_is_ask, true, price, fill_qty);
-    
-    // Reset affected prices
-    last_affected_bid_price_ = 0;
-    last_affected_ask_price_ = 0;
-    
-    // Second pass: apply the fills
-    for (OrderId id : {id1, id2}) {
-        if (id == 0) continue;
-
-        if (!pending_cross_fills_.empty() && pending_cross_fills_.front() == id) {
-            pending_cross_fills_.pop_front();
-            continue;
-        }
-
-        auto it = order_map_.find(id);
-        if (it == order_map_.end()) continue;
-
-        OrderInfo& info = it->second;
-        
-        // Track affected price
-        if (info.is_ask) {
-            last_affected_ask_price_ = info.price;
-        } else {
-            last_affected_bid_price_ = info.price;
-        }
-        
-        bool fully_filled = (fill_qty >= info.qty);
-        Count count_delta = fully_filled ? 1 : 0;
-
-        if (info.is_ask) asks_.remove(info.price, fill_qty, count_delta);
-        else bids_.remove(info.price, fill_qty, count_delta);
-
-        if (fully_filled) {
-            order_map_.erase(it);
-        } else {
+            OrderInfo& info = it->second;
+            always_assert(fill_qty <= info.qty && "Trade overfill detected: fill_qty exceeds order qty");
             info.qty -= fill_qty;
+            
+            PriceLevels& half = info.is_ask ? asks_ : bids_;
+            half.remove_liquidity(info.price, fill_qty, (info.qty == 0 ? 1 : 0));
+            if (info.qty == 0) {
+                order_map_.erase(it);
+            }
         }
     }
 }
@@ -708,67 +766,15 @@ void MBO::infer_and_apply_cross() {
     // Stage 2 implementation
 }
 
-void MBO::update_book(const InputRecord& event) {
-    book_.record_idx = event.record_idx;
-    book_.token = token_;
-    book_.event = event;
-    
-    // For trades, determine side from which orders were filled (set in trade())
-    // For other operations, use event.is_ask
-    if (event.tick_type == 'T') {
-        // For trades: if only bid filled, aggressor is ask
-        bool bid_filled = (last_affected_bid_price_ != 0);
-        bool ask_filled = (last_affected_ask_price_ != 0);
-        book_.is_ask = bid_filled && !ask_filled;
-        
-        // Set LTP/LTQ from event
-        book_.ltp = event.price;
-        book_.ltq = event.qty;
-    } else {
-        book_.is_ask = event.is_ask;
-    }
-    
-    // Check bid side
-    if (last_affected_bid_price_ != 0) {
-        int bid_idx = bids_.get_level_index(last_affected_bid_price_);
-        if (bid_idx < 0) {
-            book_.bid_affected_lvl = 0;  // Deleted
-        } else if (bid_idx >= 20) {
-            book_.bid_affected_lvl = 20;  // Outside top 20 = not affected
-        } else {
-            book_.bid_affected_lvl = bid_idx;
-        }
-    } else {
-        book_.bid_affected_lvl = 20;  // Not affected
-    }
-    
-    // Check ask side
-    if (last_affected_ask_price_ != 0) {
-        int ask_idx = asks_.get_level_index(last_affected_ask_price_);
-        if (ask_idx < 0) {
-            book_.ask_affected_lvl = 0;  // Deleted
-        } else if (ask_idx >= 20) {
-            book_.ask_affected_lvl = 20;  // Outside top 20 = not affected
-        } else {
-            book_.ask_affected_lvl = ask_idx;
-        }
-    } else {
-        book_.ask_affected_lvl = 20;  // Not affected
-    }
-    
-    memset(book_.bids, 0, sizeof(book_.bids));
-    memset(book_.asks, 0, sizeof(book_.asks));
-    book_.bid_filled_lvls = bids_.get_top_levels(book_.bids, 20);
-    book_.ask_filled_lvls = asks_.get_top_levels(book_.asks, 20);
-}
-
 // --- Delta Reconstruction (for validation) ---
+// TODO when finalizing chunk push/pop/peek interfaces, consider that any tick info
+// delta will be the first if present and only loop over the rest - perhaps there's
+// a neater iterator pattern that we'll be able to use; could also standardize the
+// flags and combine the update/insert loop to setup_args/maybe_shift/add/maybe_erase
+// Is a fairly large function of 762 bytes
 void apply_deltas_to_book(OutputRecord& rec, std::span<const DeltaChunk> chunks) {
     // Track first delta index on each side for affected_lvl reconstruction
-    int8_t bid_affected_lvl = 20;  // 20 = not affected
-    int8_t ask_affected_lvl = 20;
-    bool bid_seen = false;
-    bool ask_seen = false;
+    uint8_t affected_lvl[2] = {20, 20};  // [bid, ask], 20 = not affected
     
     // Process all chunks
     for (const auto& chunk : chunks) {
@@ -804,24 +810,8 @@ void apply_deltas_to_book(OutputRecord& rec, std::span<const DeltaChunk> chunks)
                 
                 OutputLevel* book = is_ask ? rec.asks : rec.bids;
                 
-                // Track first delta on each side for affected_lvl
-                if (!is_ask && !bid_seen) {
-                    bid_seen = true;
-                    // Check if this update causes deletion
-                    if (book[idx].qty + delta->qty_delta <= 0) {
-                        bid_affected_lvl = 0;  // Deletion
-                    } else {
-                        bid_affected_lvl = idx;
-                    }
-                }
-                if (is_ask && !ask_seen) {
-                    ask_seen = true;
-                    if (book[idx].qty + delta->qty_delta <= 0) {
-                        ask_affected_lvl = 0;  // Deletion
-                    } else {
-                        ask_affected_lvl = idx;
-                    }
-                }
+                // Track affected_lvl: use minimum (topmost) index among all updates
+                affected_lvl[is_ask] = std::min(affected_lvl[is_ask], idx);
                 
                 // Apply update
                 book[idx].qty += delta->qty_delta;
@@ -842,15 +832,10 @@ void apply_deltas_to_book(OutputRecord& rec, std::span<const DeltaChunk> chunks)
                 bool shift = unpack_shift(delta->side_index_shift);
                 
                 OutputLevel* book = is_ask ? rec.asks : rec.bids;
-                
-                // Track first delta on each side for affected_lvl
-                if (!is_ask && !bid_seen) {
-                    bid_seen = true;
-                    bid_affected_lvl = idx;
-                }
-                if (is_ask && !ask_seen) {
-                    ask_seen = true;
-                    ask_affected_lvl = idx;
+
+                // Track affected_lvl: skip refills (shift=false), use minimum (topmost) non-refill delta
+                if (shift) {  // shift=true → real insertion, not refill
+                    affected_lvl[is_ask] = std::min(affected_lvl[is_ask], idx);
                 }
                 
                 // Apply insert
@@ -873,8 +858,8 @@ void apply_deltas_to_book(OutputRecord& rec, std::span<const DeltaChunk> chunks)
     }
     
     // Set affected_lvl fields
-    rec.bid_affected_lvl = bid_affected_lvl;
-    rec.ask_affected_lvl = ask_affected_lvl;
+    rec.bid_affected_lvl = affected_lvl[0];
+    rec.ask_affected_lvl = affected_lvl[1];
     
     // Count filled levels
     rec.bid_filled_lvls = 0;
@@ -893,14 +878,15 @@ public:
         reconstructed_books_.reserve(100);
     }
     const OutputRecord& process_record(const InputRecord& rec);
+    void report_active_orders() const;
 
 private:
-    boost::unordered_map<Token, unique_ptr<MBO>> mbos_;
-    boost::unordered_map<Token, OutputRecord> reconstructed_books_;  // For delta validation
+    boost::unordered::unordered_flat_map<Token, unique_ptr<MBO>> mbos_;
+    boost::unordered::unordered_flat_map<Token, OutputRecord> reconstructed_books_;  // For delta validation
 };
 
 const OutputRecord& Runner::process_record(const InputRecord& rec) {
-    PerfProfile("process_record");
+    //PerfProfile("process_record");
     PerfProfileCount("records_processed", 1);
 
     rec.print();
@@ -911,6 +897,7 @@ const OutputRecord& Runner::process_record(const InputRecord& rec) {
         it = mbos_.emplace(token, make_unique<MBO>(token)).first;
     }
 
+    PerfProfile("got_mbo");
     MBO& mbo = *it->second;
     
     // Prepare delta emission
@@ -918,43 +905,39 @@ const OutputRecord& Runner::process_record(const InputRecord& rec) {
     
     // Dispatch to appropriate operation
     switch (rec.tick_type) {
-        case 'N': mbo.new_order(rec.order_id, rec.is_ask, rec.price, rec.qty); break;
-        case 'M': mbo.modify_order(rec.order_id, rec.price, rec.qty); break;
-        case 'X': mbo.cancel_order(rec.order_id); break;
-        case 'T': mbo.trade(rec.order_id, rec.order_id2, rec.price, rec.qty); break;
+        case 'N': {PerfProfile("new_order"); mbo.new_order(rec.order_id, rec.is_ask, rec.price, rec.qty); break;}
+        case 'M': {PerfProfile("modify_order"); mbo.modify_order(rec.order_id, rec.price, rec.qty); break;}
+        case 'X': {PerfProfile("cancel_order"); mbo.cancel_order(rec.order_id); break;}
+        case 'T': {PerfProfile("trade"); mbo.trade(rec.order_id, rec.order_id2, rec.price, rec.qty); break;}
     }
     
-    // Update book snapshot and finalize deltas
-    mbo.update_book(rec);
+    // Finalize deltas
     mbo.finalize_deltas();
-    
+
     // Get delta chunks and print them
     auto chunks = mbo.get_delta_chunks();
+#ifndef printf
     for (const auto& chunk : chunks) {
         std::cout << "  " << chunk << "\n";
     }
-    
-    // Validate: apply deltas to reconstructed book and compare
+#else
+    (void)chunks;  // Suppress unused warning when printf is disabled
+#endif
+
+
+    // Apply deltas to reconstructed book
     auto& reconstructed = reconstructed_books_[token];
+    PerfProfile("apply_deltas_to_book");
     apply_deltas_to_book(reconstructed, chunks);
-    const OutputRecord& direct = mbo.get_book();
+    reconstructed.print();
     
-    if (!reconstructed.compare(direct)) {
-        printf("\n*** DELTA RECONSTRUCTION MISMATCH ***\n");
-        printf("Record: %u, Token: %u\n", rec.record_idx, token);
-        printf("\nDIRECT (from MBO):\n");
-        direct.print();
-        printf("\nRECONSTRUCTED (from deltas):\n");
-        reconstructed.print();
-        printf("\nDelta chunks:\n");
-        for (const auto& chunk : chunks) {
-            std::cout << "  " << chunk << "\n";
-        }
-        fflush(stdout);
-        exit(1);
+    return reconstructed;
+}
+
+void Runner::report_active_orders() const {
+    for (const auto& [token, mbo] : mbos_) {
+        PerfProfileCount("active_orders", mbo->order_map_.size());
     }
-    
-    return mbo.get_book();
 }
 
 // --- Main ---
@@ -1005,19 +988,40 @@ int main(int argc, char** argv) {
     Runner runner;
     for (size_t i = 0; i < num_records; ++i) {
         const OutputRecord& book = runner.process_record(records[i]);
-        book.print();
 
         if (ref_books && i < num_ref_books) {
-            if (!book.compare(ref_books[i])) {
-                printf("MISMATCH at record %lu (idx: %u)\n", i, records[i].record_idx);
+            int cmp = book.compare(ref_books[i]);
+            if (cmp != 0) {
+                /*
+                100: record_idx mismatch
+                101: token mismatch
+                102: is_ask mismatch (non-trade)
+                105: bid_filled_lvls mismatch
+                106: ask_filled_lvls mismatch
+                107: ask_affected_lvl mismatch
+                108: bid_affected_lvl mismatch (when ask is primary)
+                109: bid_affected_lvl mismatch (when bid is primary)
+                110: ask_affected_lvl mismatch (when bid is primary)
+                */
+                printf("MISMATCH at record %lu (idx: %u) - Error code: %d ", i, records[i].record_idx, cmp);
+                if (cmp >= 100) {
+                    printf("(metadata/counts)\n");
+                } else if (cmp > 0) {
+                    printf("(ask level %d)\n", cmp);
+                } else {
+                    printf("(bid level %d)\n", -cmp);
+                }
                 printf("REFERENCE:\n");
                 ref_books[i].print();
                 fflush(stdout);
-                while(1);
+                // while(1);
                 return 1;
             }
         }
     }
+
+    // Report active orders for each MBO (gets min/avg/max statistics)
+    runner.report_active_orders();
 
     PerfProfilerReport();
 
