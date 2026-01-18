@@ -200,11 +200,11 @@ for (auto& lvl : refill_levels) {
 }
 ```
 
-MBO::update_book() finalizes sequence:
-- Prepend TickInfo from input event
-- Pack deltas into 64-byte chunks
-- Set `final` flag on last chunk
-- No need for `last_affected_price` state tracking
+MBO operations emit TickInfo first, then delegate to PriceLevels:
+- TickInfo emitted at operation start (new_order, modify_order, etc.)
+- PriceLevels operations (add/remove) emit Update/Insert deltas inline
+- Runner calls finalize_deltas() to set final flag on last chunk
+- No redundant state tracking (last_affected_price, book_, etc.)
 
 ## Open Questions (Deferred)
 
@@ -311,9 +311,10 @@ Reference implementation (CROSSING.md) generates multiple ticks per exchange eve
   - Add `get_delta_chunks()` accessor
   - Runner now calls mbo.process_event() instead of individual operations
 
-- [ ] **4.4** Remove last_affected_price tracking (deferred to post-validation)
-  - Delete `last_affected_bid_price_`, `last_affected_ask_price_`
-  - affected_lvl now computed from deltas (post-validation, for reference compat)
+- [x] **4.4** Removed last_affected_price tracking
+  - Deleted `last_affected_bid_price_`, `last_affected_ask_price_`
+  - affected_lvl now computed from deltas during reconstruction (no lookups!)
+  - Removed redundant book_ member and update_book() from MBO
 
 ### Phase 5: Runner & Validation
 
@@ -322,19 +323,20 @@ Reference implementation (CROSSING.md) generates multiple ticks per exchange eve
   - Print all chunks with operator<< overload
 
 - [x] **5.2** Implement delta reconstruction (for validation)
-  - New function: `reconstruct_from_deltas(chunks) → OutputRecord`
-  - Apply each delta sequentially to empty book
+  - New function: `apply_deltas_to_book(OutputRecord& rec, chunks)` 
+  - Apply each delta sequentially to incremental book state
   - Track first delta index per side for affected_lvl (no lookups!)
-  - Return final OutputRecord with all fields
+  - Count filled levels after all deltas applied
 
 - [x] **5.3** Compare reconstructed vs direct OutputRecord
-  - Both methods should produce identical book state
-  - Use OutputRecord::compare() method
-  - Exit with detailed diff on mismatch
+  - Both methods produced identical book state
+  - Used OutputRecord::compare() method
+  - Validation passed on full test suite (20,000 records)
 
-- [x] **5.4** Preserve OutputRecord generation initially
-  - Keep update_book() logic for reference comparison
-  - Remove only after delta validation passes on full test suite
+- [x] **5.4** Removed redundant OutputRecord generation from MBO
+  - Deleted update_book(), book_, last_affected_*_price_ tracking
+  - Runner now relies exclusively on delta reconstruction
+  - All fields (affected_lvl, filled_lvls, ltp, ltq, is_ask) correctly reconstructed from deltas
 
 ### Phase 6: Testing & Refinement
 
