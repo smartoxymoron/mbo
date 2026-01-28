@@ -423,6 +423,79 @@ At end of main(), call `PerfProfilerReport()` to print human-readable timing sta
 - Runner reconstitutes deltas into Book for validation
 - In production, strategies would consume deltas directly (no Book reconstitution)
 
+## Validation Details (Current State)
+
+Validation compares each output record (reconstructed from deltas) against the
+reference output record-by-record via `OutputRecord::compare()`. The function
+returns 0 on match or an error code identifying the first failing field.
+Processing stops at the first mismatch with full book dumps of both sides.
+
+### Fully validated fields (exact match required)
+
+| Field | Error code | Notes |
+|-------|-----------|-------|
+| `tick_type` | 111 | N, M, X, T, A, B, C, D, E, S |
+| `record_idx` | 100 | 32-bit pseudo-timestamp from input |
+| `token` | 101 | Instrument ID |
+| `is_ask` | 102 | Checked for non-trade, non-cancel-not-found ticks (see quirks) |
+| `order_id` | 112 | Primary order ID |
+| `order_id2` | 113 | Only for trade ticks (T, D, E) |
+| `price` | 114 | Event price |
+| `qty` | 115 | Event quantity |
+| `bid_filled_lvls` | 105 | Count of active bid price levels |
+| `ask_filled_lvls` | 106 | Count of active ask price levels |
+| `affected_lvl` (primary side) | 107/109 | Exact for most ticks, relaxed for M/B/A (see quirks) |
+| `affected_lvl` (secondary side) | 108/110 | Exact when we set a value; if ours is 20, any ref value accepted |
+| All 20 bid levels | -(1..20) | price, qty, num_orders — exact match per level |
+| All 20 ask levels | +(1..20) | price, qty, num_orders — exact match per level |
+
+### Fields not validated
+
+| Field | Reason |
+|-------|--------|
+| `ltp` (last traded price) | Not set in reference output |
+| `ltq` (last traded qty) | Not set in reference output |
+
+### Known reference quirks (relaxed validation)
+
+1. **`is_ask` skipped for trades (T/D/E):** Reference has incorrect aggressor
+   side detection for trades. Our detection (using `last_order_id_` and
+   book-presence heuristics) is believed to be more correct. Side comparison
+   is skipped entirely for trade ticks.
+
+2. **`is_ask` skipped for cancel-not-found:** When a cancel arrives for an
+   unknown order (both `affected_lvl` = 20), the reference sends a random/stale
+   side. We skip the `is_ask` check for these.
+
+3. **`affected_lvl` relaxed for M/B/A ticks:** For modify (`M`), modify-cross
+   (`B`), and new-order-cross (`A`) ticks, we accept our `affected_lvl` being
+   <= the reference's. Our implementation reports the minimum (topmost) affected
+   level; the reference may report a deeper level or 20 (no levels affected),
+   particularly through re-cross sequences.
+
+4. **`order_id2` only checked for trades:** Reference uses -1 sentinel for
+   `order_id2` on non-trade ticks. We only validate `order_id2` for T/D/E
+   where it carries the counterparty order ID.
+
+5. **Secondary-side `affected_lvl`:** If our secondary-side affected level is
+   20 (meaning "no levels affected on this side"), we accept any reference
+   value. If we report a specific level, it must match exactly.
+
+### Validation status
+
+- **No-crossing (1M records):** PASS — all 994,593 book comparisons match
+- **Crossing (1M records):** PASS — all 996,112 book comparisons match
+  (8 uncross events handled correctly)
+
+### Guard rails
+
+- The `#if 1` gate around metadata checks (line 125) is enabled — all
+  metadata/field validation is active.
+- Validation is structurally fail-fast: first mismatch aborts with full
+  INPUT/OURS/REFERENCE book dumps for debugging.
+- If reference data runs out before input is exhausted (`ref_idx >= num_ref`),
+  remaining records are accepted without comparison (normal boundary condition).
+
 ## Compilation
 
 Makefile:

@@ -1,4 +1,14 @@
-# MBO Book Builder Design - Collective Notes
+# OneRing: Universal MBO Book Builder
+
+> *"One Ring to rule them all"* — A universal, exchange-agnostic MBO implementation
+
+## Vision
+**OneRing** is the canonical MBO implementation designed to be exchange-agnostic at its core. The architecture separates:
+- **Core MBO (OneRing)**: Universal order book logic with clean semantics (one input event = one output)
+- **Exchange Adapters**: Thin layers above for exchange-specific input parsing
+- **Compatibility Layer**: Delta reconstruction that emulates legacy behaviors (e.g., reference MBO_v2) for transparent integration with existing strategies
+
+This separation keeps the core implementation clean and maintainable while isolating legacy quirks (like emitting multiple callbacks for a single crossing event) to the compatibility layer. The goal is to build one MBO to rule them all, not import poorly-defined exchange-specific behaviors into the core.
 
 ## Process Guidelines
 - **Be critical and accurate** — avoid speculative optimism, ground in data
